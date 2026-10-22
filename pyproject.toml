@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langtext"
-version = "0.1.0"
-description = "Write AI agents using Python and natural-language function bodies."
+version = "0.1.1"
+description = "Build structured LLM agents with Python decorators, natural-language instructions, and tools."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -26,10 +26,11 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.0",
-    "google-genai>=0.1.0",
+    "google-genai>=1.0.0",
     "openai>=1.0.0",
-    "fastmcp>=0.1.0",
-    "python-dotenv>=1.0.0"
+    "fastmcp>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.32.0",
 ]
 
 [tool.hatch.build.targets.wheel]
