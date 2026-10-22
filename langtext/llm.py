@@ -9,6 +9,51 @@ from pydantic import BaseModel
 from langtext.tools import Tool
 
 
+def execute_required_tools(
+    tools: list[Tool],
+    input_arguments: dict[str, Any],
+    max_tool_calls: int,
+) -> dict[str, Any]:
+    """Execute every configured tool using matching function inputs."""
+
+    if len(tools) > max_tool_calls:
+        raise ValueError(
+            f"Required mode has {len(tools)} tools, exceeding "
+            f"max_tool_calls={max_tool_calls}."
+        )
+
+    results: dict[str, Any] = {}
+
+    for tool in tools:
+        arguments: dict[str, Any] = {}
+
+        for name, field in tool.args_model.model_fields.items():
+            if name in input_arguments:
+                arguments[name] = input_arguments[name]
+            elif field.is_required():
+                raise ValueError(
+                    f"Cannot execute required tool '{tool.name}': "
+                    f"missing required argument '{name}'. "
+                    "Required tool arguments must match names of the "
+                    "decorated function's input parameters."
+                )
+
+        results[tool.name] = tool.execute(arguments)
+
+    return results
+
+
+def format_tool_results(results: dict[str, Any]) -> str:
+    """Format tool results for the model."""
+
+    return (
+        "The following tools have already been executed by LangText. "
+        "Use their results when producing your answer. Do not assume "
+        "additional tool executions have occurred.\n\n"
+        + json.dumps(results, indent=2, default=str)
+    )
+
+
 class LLMAdapter(ABC):
     @abstractmethod
     def generate_structured_json(
@@ -17,6 +62,8 @@ class LLMAdapter(ABC):
         schema: type[BaseModel],
         tools: list[Tool],
         max_tool_calls: int = 10,
+        tool_policy: str = "auto",
+        tool_results: dict[str, Any] | None = None,
     ) -> str:
         raise NotImplementedError
 
@@ -34,15 +81,26 @@ class OpenAIAdapter(LLMAdapter):
         schema: type[BaseModel],
         tools: list[Tool],
         max_tool_calls: int = 10,
+        tool_policy: str = "auto",
+        tool_results: dict[str, Any] | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": prompt}
         ]
-        tools_by_name = {item.name: item for item in tools}
-        tool_schemas = [item.openai_schema() for item in tools]
-        calls_made = 0
 
-        if tools:
+        if tool_policy == "required":
+            messages.append({
+                "role": "user",
+                "content": format_tool_results(tool_results or {}),
+            })
+
+        elif tool_policy == "auto" and tools:
+            tools_by_name = {item.name: item for item in tools}
+            tool_schemas = [
+                item.openai_schema() for item in tools
+            ]
+            calls_made = 0
+
             while True:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
@@ -61,7 +119,6 @@ class OpenAIAdapter(LLMAdapter):
                         })
                     break
 
-                # Preserve the assistant tool-call message in conversation history.
                 messages.append(
                     message.model_dump(exclude_none=True)
                 )
@@ -75,7 +132,7 @@ class OpenAIAdapter(LLMAdapter):
                     tool = tools_by_name.get(call.function.name)
                     if tool is None:
                         raise ValueError(
-                            f"Model requested unavailable tool: "
+                            "Model requested unavailable tool: "
                             f"{call.function.name}"
                         )
 
@@ -89,6 +146,11 @@ class OpenAIAdapter(LLMAdapter):
                     })
                     calls_made += 1
 
+        elif tool_policy not in ("auto", "required"):
+            raise ValueError(
+                f"Unsupported tool policy: {tool_policy}"
+            )
+
         response = self.client.beta.chat.completions.parse(
             model=self.model_name,
             messages=messages,
@@ -101,7 +163,9 @@ class OpenAIAdapter(LLMAdapter):
 
         content = response.choices[0].message.content
         if not content:
-            raise RuntimeError("OpenAI returned no structured output.")
+            raise RuntimeError(
+                "OpenAI returned no structured output."
+            )
 
         return content
 
@@ -121,26 +185,37 @@ class GeminiAdapter(LLMAdapter):
         schema: type[BaseModel],
         tools: list[Tool],
         max_tool_calls: int = 10,
+        tool_policy: str = "auto",
+        tool_results: dict[str, Any] | None = None,
     ) -> str:
         types = self.types
-        tools_by_name = {item.name: item for item in tools}
-
         history: list[Any] = [prompt]
-        calls_made = 0
 
-        declarations = [
-            types.FunctionDeclaration(
-                name=item.name,
-                description=item.description,
-                parameters_json_schema=item.args_model.model_json_schema(),
+        if tool_policy == "required":
+            history.append(
+                format_tool_results(tool_results or {})
             )
-            for item in tools
-        ]
 
-        if tools:
+        elif tool_policy == "auto" and tools:
+            tools_by_name = {
+                item.name: item for item in tools
+            }
+
+            declarations = [
+                types.FunctionDeclaration(
+                    name=item.name,
+                    description=item.description,
+                    parameters_json_schema=(
+                        item.args_model.model_json_schema()
+                    ),
+                )
+                for item in tools
+            ]
+
             tool_config = [
                 types.Tool(function_declarations=declarations)
             ]
+            calls_made = 0
 
             while True:
                 response = self.client.models.generate_content(
@@ -152,7 +227,9 @@ class GeminiAdapter(LLMAdapter):
                 )
 
                 if not response.candidates:
-                    raise RuntimeError("Gemini returned no candidates.")
+                    raise RuntimeError(
+                        "Gemini returned no candidates."
+                    )
 
                 content = response.candidates[0].content
                 history.append(content)
@@ -177,7 +254,8 @@ class GeminiAdapter(LLMAdapter):
                     tool = tools_by_name.get(call.name)
                     if tool is None:
                         raise ValueError(
-                            f"Model requested unavailable tool: {call.name}"
+                            "Model requested unavailable tool: "
+                            f"{call.name}"
                         )
 
                     arguments = dict(call.args or {})
@@ -198,6 +276,11 @@ class GeminiAdapter(LLMAdapter):
                     )
                 )
 
+        elif tool_policy not in ("auto", "required"):
+            raise ValueError(
+                f"Unsupported tool policy: {tool_policy}"
+            )
+
         response = self.client.models.generate_content(
             model=self.model_name,
             contents=history,
@@ -209,7 +292,9 @@ class GeminiAdapter(LLMAdapter):
         )
 
         if not response.text:
-            raise RuntimeError("Gemini returned no structured output.")
+            raise RuntimeError(
+                "Gemini returned no structured output."
+            )
 
         return response.text
 
@@ -229,4 +314,6 @@ class LLMClientFactory:
                 raise KeyError("Missing OPENAI_API_KEY.")
             return OpenAIAdapter(model_name)
 
-        raise ValueError(f"Unsupported model: '{model_name}'.")
+        raise ValueError(
+            f"Unsupported model: '{model_name}'."
+        )
